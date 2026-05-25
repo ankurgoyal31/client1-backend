@@ -1,36 +1,43 @@
-# dependencies
+# Dependencies
 node_modules/
 
-# build output
-dist/
-build/
-
-# environment variables (VERY IMPORTANT)
+# Secrets — never commit
 .env
 .env.local
+.env.*.local
 .env.production
+.env.development
 
-# logs
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
 logs/
 *.log
 npm-debug.log*
+pnpm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# OS files
+# OS
 .DS_Store
 Thumbs.db
 
-# IDE files
-.vscode/
+# IDE (optional)
 .idea/
+.vscode/
+*.swp
 
-# temporary files
+# Cache / temp
+.cache/
 tmp/
 temp/
 
-# lock files (optional - agar clean rakhna hai)
-pnpm-lock.yaml
+# Test output
+coverage/
+test-results/
+playwright-report/
 
-# cache
-.cache/
+# NOTE: Do NOT ignore package-lock.json or api-server/packages/ — Render needs them

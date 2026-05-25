@@ -10,8 +10,39 @@ import { setObjectAclPolicy, type ObjectAclPolicy } from "../../lib/objectAcl.js
 import { compressImage } from "../../lib/mediaCompress/image.js";
 import { compressVideo } from "../../lib/mediaCompress/video.js";
 import type { File as GcsFile } from "@google-cloud/storage";
+import fs from "node:fs";
 
 const router = Router();
+
+const USE_LOCAL_STORAGE = process.env.STORAGE_PROVIDER === "local" || !process.env.REPL_ID;
+const UPLOADS_DIR = path.join(process.cwd(), "uploads");
+const TEMP_DIR = path.join(UPLOADS_DIR, "temp");
+const PUBLIC_DIR = path.join(UPLOADS_DIR, "public");
+
+if (USE_LOCAL_STORAGE) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+  fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+}
+
+// PUT handler for local uploads (does not require admin bearer token)
+router.put("/local-put", async (req: Request, res: Response) => {
+  const { objectId } = req.query;
+  if (typeof objectId !== "string" || !objectId) {
+    res.status(400).json({ error: "Missing objectId" });
+    return;
+  }
+
+  try {
+    const tempFilePath = path.join(TEMP_DIR, objectId);
+    const writeStream = fs.createWriteStream(tempFilePath);
+    await pipeline(req, writeStream);
+    res.status(200).send("OK");
+  } catch (err) {
+    console.error("Local upload PUT failed:", err);
+    res.status(500).json({ error: "Local upload failed" });
+  }
+});
+
 router.use(requireAdmin);
 
 const objectStorageService = new ObjectStorageService();
@@ -125,6 +156,20 @@ async function handleUploadUrlRequest(
   }
 
   try {
+    if (USE_LOCAL_STORAGE) {
+      const objectId = randomUUID();
+      const metadataPath = path.join(TEMP_DIR, `${objectId}.json`);
+      await fsp.writeFile(
+        metadataPath,
+        JSON.stringify({ contentType, size, kind: classification.kind })
+      );
+
+      const uploadURL = `/api/admin/uploads/local-put?objectId=${objectId}`;
+      const objectPath = `/objects/uploads/${objectId}`;
+      res.json({ uploadURL, objectPath, kind: classification.kind });
+      return;
+    }
+
     const uploadURL = await objectStorageService.getObjectEntityUploadURL();
     const objectPath = objectStorageService.normalizeObjectEntityPath(uploadURL);
     res.json({ uploadURL, objectPath, kind: classification.kind });
@@ -169,6 +214,104 @@ async function finalizeHandler(req: Request, res: Response) {
   if (!adminId) {
     res.status(401).json({ error: "Unauthorized" });
     return;
+  }
+
+  if (USE_LOCAL_STORAGE) {
+    const parts = objectPath.slice(1).split("/");
+    const objectId = parts[parts.length - 1];
+    const tempFilePath = path.join(TEMP_DIR, objectId);
+    const tempMetadataPath = path.join(TEMP_DIR, `${objectId}.json`);
+
+    try {
+      if (!fs.existsSync(tempFilePath) || !fs.existsSync(tempMetadataPath)) {
+        res.status(400).json({ error: "Uploaded file not found" });
+        return;
+      }
+
+      const metadataContent = await fsp.readFile(tempMetadataPath, "utf8");
+      const metadata = JSON.parse(metadataContent);
+      const contentType = metadata.contentType;
+      const originalBytes = metadata.size;
+
+      const publicURL = `/api/storage/objects/uploads/${objectId}`;
+
+      let result: FinalizeResult = {
+        publicURL,
+        originalBytes,
+        storedBytes: originalBytes,
+        compressed: false,
+      };
+
+      const finalFilePath = path.join(PUBLIC_DIR, objectId);
+      const finalMetadataPath = path.join(PUBLIC_DIR, `${objectId}.json`);
+
+      let compressedBytes = originalBytes;
+      let isCompressed = false;
+      let warning: string | undefined;
+
+      const classification = classifyContentType(contentType);
+
+      if (classification && classification.kind === "image") {
+        try {
+          const originalBuffer = await fsp.readFile(tempFilePath);
+          const compressed = await compressImage(originalBuffer, contentType);
+          if (compressed && !compressed.skipped) {
+            await fsp.writeFile(finalFilePath, compressed.buffer);
+            compressedBytes = compressed.compressedBytes;
+            isCompressed = true;
+          } else {
+            await fsp.copyFile(tempFilePath, finalFilePath);
+          }
+        } catch (err) {
+          req.log.warn({ err }, "Local image compression failed - using original");
+          await fsp.copyFile(tempFilePath, finalFilePath);
+          warning = "Image compression failed — original kept";
+        }
+      } else if (classification && classification.kind === "video") {
+        const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vidcomp-"));
+        const outputPath = path.join(tmpDir, `out-${randomUUID()}.mp4`);
+        try {
+          const compressed = await compressVideo(tempFilePath, outputPath);
+          if (compressed && !compressed.skipped) {
+            await fsp.copyFile(outputPath, finalFilePath);
+            compressedBytes = compressed.compressedBytes;
+            isCompressed = true;
+          } else {
+            await fsp.copyFile(tempFilePath, finalFilePath);
+          }
+        } catch (err) {
+          req.log.warn({ err }, "Local video compression failed - using original");
+          await fsp.copyFile(tempFilePath, finalFilePath);
+          warning = "Video compression failed — original kept";
+        } finally {
+          await fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+        }
+      } else {
+        await fsp.copyFile(tempFilePath, finalFilePath);
+      }
+
+      await fsp.writeFile(
+        finalMetadataPath,
+        JSON.stringify({ contentType, size: compressedBytes })
+      );
+
+      await fsp.unlink(tempFilePath).catch(() => {});
+      await fsp.unlink(tempMetadataPath).catch(() => {});
+
+      res.json({
+        objectPath: `/objects/uploads/${objectId}`,
+        publicURL,
+        originalBytes,
+        storedBytes: compressedBytes,
+        compressed: isCompressed,
+        ...(warning ? { warning } : {}),
+      });
+      return;
+    } catch (err) {
+      req.log.error({ err }, "Failed to finalize local upload");
+      res.status(500).json({ error: "Failed to finalize upload" });
+      return;
+    }
   }
 
   let normalized: string;
